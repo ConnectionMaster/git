@@ -585,6 +585,49 @@ test_expect_success 'deepen-relative' '
 	test_cmp expected actual
 '
 
+setup_negotiate_only () {
+	SERVER="$1"
+	URI="$2"
+
+	rm -rf "$SERVER" client
+
+	git init "$SERVER"
+	test_commit -C "$SERVER" one
+	test_commit -C "$SERVER" two
+
+	git clone "$URI" client
+	test_commit -C client three
+}
+
+test_expect_success 'file:// --negotiate-only' '
+	SERVER="server" &&
+	URI="file://$(pwd)/server" &&
+
+	setup_negotiate_only "$SERVER" "$URI" &&
+
+	git -c protocol.version=2 -C client fetch \
+		--no-tags \
+		--negotiate-only \
+		--negotiation-tip=$(git -C client rev-parse HEAD) \
+		origin >out &&
+	COMMON=$(git -C "$SERVER" rev-parse two) &&
+	grep "$COMMON" out
+'
+
+test_expect_success 'file:// --negotiate-only with protocol v0' '
+	SERVER="server" &&
+	URI="file://$(pwd)/server" &&
+
+	setup_negotiate_only "$SERVER" "$URI" &&
+
+	test_must_fail git -c protocol.version=0 -C client fetch \
+		--no-tags \
+		--negotiate-only \
+		--negotiation-tip=$(git -C client rev-parse HEAD) \
+		origin 2>err &&
+	test_i18ngrep "negotiate-only requires protocol v2" err
+'
+
 # Test protocol v2 with 'http://' transport
 #
 . "$TEST_DIRECTORY"/lib-httpd.sh
@@ -875,11 +918,31 @@ test_expect_success 'part of packfile response provided as URI' '
 	test -f hfound &&
 	test -f h2found &&
 
-	# Ensure that there are exactly 6 files (3 .pack and 3 .idx).
-	ls http_child/.git/objects/pack/*.pack >packlist &&
-	ls http_child/.git/objects/pack/*.idx >idxlist &&
-	test_line_count = 3 idxlist &&
-	test_line_count = 3 packlist
+	# Ensure that there are exactly 3 packfiles with associated .idx
+	ls http_child/.git/objects/pack/*.pack \
+	    http_child/.git/objects/pack/*.idx >filelist &&
+	test_line_count = 6 filelist
+'
+
+test_expect_success 'packfile URIs with fetch instead of clone' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child log &&
+
+	git init "$P" &&
+	git -C "$P" config "uploadpack.allowsidebandall" "true" &&
+
+	echo my-blob >"$P/my-blob" &&
+	git -C "$P" add my-blob &&
+	git -C "$P" commit -m x &&
+
+	configure_exclusion "$P" my-blob >h &&
+
+	git init http_child &&
+
+	GIT_TEST_SIDEBAND_ALL=1 \
+	git -C http_child -c protocol.version=2 \
+		-c fetch.uriprotocols=http,https \
+		fetch "$HTTPD_URL/smart/http_parent"
 '
 
 test_expect_success 'fetching with valid packfile URI but invalid hash fails' '
@@ -931,11 +994,10 @@ test_expect_success 'packfile-uri with transfer.fsckobjects' '
 		-c fetch.uriprotocols=http,https \
 		clone "$HTTPD_URL/smart/http_parent" http_child &&
 
-	# Ensure that there are exactly 4 files (2 .pack and 2 .idx).
-	ls http_child/.git/objects/pack/*.pack >packlist &&
-	ls http_child/.git/objects/pack/*.idx >idxlist &&
-	test_line_count = 2 idxlist &&
-	test_line_count = 2 packlist
+	# Ensure that there are exactly 2 packfiles with associated .idx
+	ls http_child/.git/objects/pack/*.pack \
+	    http_child/.git/objects/pack/*.idx >filelist &&
+	test_line_count = 4 filelist
 '
 
 test_expect_success 'packfile-uri with transfer.fsckobjects fails on bad object' '
@@ -966,6 +1028,100 @@ test_expect_success 'packfile-uri with transfer.fsckobjects fails on bad object'
 		-c fetch.uriprotocols=http,https \
 		clone "$HTTPD_URL/smart/http_parent" http_child 2>error &&
 	test_i18ngrep "invalid author/committer line - missing email" error
+'
+
+test_expect_success 'packfile-uri with transfer.fsckobjects succeeds when .gitmodules is separate from tree' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child &&
+
+	git init "$P" &&
+	git -C "$P" config "uploadpack.allowsidebandall" "true" &&
+
+	echo "[submodule libfoo]" >"$P/.gitmodules" &&
+	echo "path = include/foo" >>"$P/.gitmodules" &&
+	echo "url = git://example.com/git/lib.git" >>"$P/.gitmodules" &&
+	git -C "$P" add .gitmodules &&
+	git -C "$P" commit -m x &&
+
+	configure_exclusion "$P" .gitmodules >h &&
+
+	sane_unset GIT_TEST_SIDEBAND_ALL &&
+	git -c protocol.version=2 -c transfer.fsckobjects=1 \
+		-c fetch.uriprotocols=http,https \
+		clone "$HTTPD_URL/smart/http_parent" http_child &&
+
+	# Ensure that there are exactly 2 packfiles with associated .idx
+	ls http_child/.git/objects/pack/*.pack \
+	    http_child/.git/objects/pack/*.idx >filelist &&
+	test_line_count = 4 filelist
+'
+
+test_expect_success 'packfile-uri with transfer.fsckobjects fails when .gitmodules separate from tree is invalid' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child err &&
+
+	git init "$P" &&
+	git -C "$P" config "uploadpack.allowsidebandall" "true" &&
+
+	echo "[submodule \"..\"]" >"$P/.gitmodules" &&
+	echo "path = include/foo" >>"$P/.gitmodules" &&
+	echo "url = git://example.com/git/lib.git" >>"$P/.gitmodules" &&
+	git -C "$P" add .gitmodules &&
+	git -C "$P" commit -m x &&
+
+	configure_exclusion "$P" .gitmodules >h &&
+
+	sane_unset GIT_TEST_SIDEBAND_ALL &&
+	test_must_fail git -c protocol.version=2 -c transfer.fsckobjects=1 \
+		-c fetch.uriprotocols=http,https \
+		clone "$HTTPD_URL/smart/http_parent" http_child 2>err &&
+	test_i18ngrep "disallowed submodule name" err
+'
+
+test_expect_success 'http:// --negotiate-only' '
+	SERVER="$HTTPD_DOCUMENT_ROOT_PATH/server" &&
+	URI="$HTTPD_URL/smart/server" &&
+
+	setup_negotiate_only "$SERVER" "$URI" &&
+
+	git -c protocol.version=2 -C client fetch \
+		--no-tags \
+		--negotiate-only \
+		--negotiation-tip=$(git -C client rev-parse HEAD) \
+		origin >out &&
+	COMMON=$(git -C "$SERVER" rev-parse two) &&
+	grep "$COMMON" out
+'
+
+test_expect_success 'http:// --negotiate-only without wait-for-done support' '
+	SERVER="server" &&
+	URI="$HTTPD_URL/one_time_perl/server" &&
+
+	setup_negotiate_only "$SERVER" "$URI" &&
+
+	echo "s/ wait-for-done/ xxxx-xxx-xxxx/" \
+		>"$HTTPD_ROOT_PATH/one-time-perl" &&
+
+	test_must_fail git -c protocol.version=2 -C client fetch \
+		--no-tags \
+		--negotiate-only \
+		--negotiation-tip=$(git -C client rev-parse HEAD) \
+		origin 2>err &&
+	test_i18ngrep "server does not support wait-for-done" err
+'
+
+test_expect_success 'http:// --negotiate-only with protocol v0' '
+	SERVER="$HTTPD_DOCUMENT_ROOT_PATH/server" &&
+	URI="$HTTPD_URL/smart/server" &&
+
+	setup_negotiate_only "$SERVER" "$URI" &&
+
+	test_must_fail git -c protocol.version=0 -C client fetch \
+		--no-tags \
+		--negotiate-only \
+		--negotiation-tip=$(git -C client rev-parse HEAD) \
+		origin 2>err &&
+	test_i18ngrep "negotiate-only requires protocol v2" err
 '
 
 # DO NOT add non-httpd-specific tests here, because the last part of this
